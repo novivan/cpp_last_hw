@@ -9,7 +9,7 @@
 #include <future>
 #include <cstring>
 #include <chrono>
-#include <random>
+#include <random>s
 #include <array>
 #include <cassert>
 #include <tuple>
@@ -194,6 +194,12 @@ int UT = 0;
 mt19937 rnd(1337);
 
 tuple<Fixed, bool, pair<int, int>> propagate_flow(int x, int y, Fixed lim) {
+    // Добавление проверки начальных границ
+    if (x < 0 || x >= N || y < 0 || y >= M) {
+        cerr << "propagate_flow: Неверные координаты x=" << x << ", y=" << y << "\n";
+        return {0, false, {0, 0}};
+    }
+
     last_use[x][y] = UT - 1;
     Fixed ret = 0;
     for (auto [dx, dy] : deltas) {
@@ -201,6 +207,7 @@ tuple<Fixed, bool, pair<int, int>> propagate_flow(int x, int y, Fixed lim) {
 
         // Проверка границ массива
         if (nx < 0 || nx >= N || ny < 0 || ny >= M) {
+            cerr << "propagate_flow: Пропуск границы для nx=" << nx << ", ny=" << ny << "\n";
             continue;
         }
 
@@ -288,6 +295,12 @@ struct ParticleParams {
 };
 
 bool propagate_move(int x, int y, bool is_first) {
+    // Добавление проверки начальных границ
+    if (x < 0 || x >= N || y < 0 || y >= M) {
+        cerr << "propagate_move: Неверные координаты x=" << x << ", y=" << y << "\n";
+        return false;
+    }
+
     {
         std::lock_guard<std::recursive_mutex> lock(last_use_mutex);
         last_use[x][y] = UT - is_first;
@@ -304,6 +317,7 @@ bool propagate_move(int x, int y, bool is_first) {
 
             // Проверка границ массива
             if (nx_new < 0 || nx_new >= N || ny_new < 0 || ny_new >= M) {
+                cerr << "propagate_move: Пропуск границы для nx_new=" << nx_new << ", ny_new=" << ny_new << "\n";
                 tres[i] = sum;
                 continue;
             }
@@ -328,12 +342,19 @@ bool propagate_move(int x, int y, bool is_first) {
         Fixed p_val = random01() * sum;
         size_t d = std::ranges::upper_bound(tres, p_val) - tres.begin();
 
+        // Проверка корректности индекса
+        if (d >= deltas.size()) {
+            cerr << "propagate_move: Некорректный индекс deltas d=" << d << "\n";
+            break;
+        }
+
         auto [dx, dy] = deltas[d];
         nx = x + dx;
         ny = y + dy;
 
         // Дополнительная проверка границ
         if (nx < 0 || nx >= N || ny < 0 || ny >= M) {
+            cerr << "propagate_move: Неверные координаты после смещения nx=" << nx << ", ny=" << ny << "\n";
             continue;
         }
 
@@ -364,6 +385,7 @@ bool propagate_move(int x, int y, bool is_first) {
 
             // Проверка границ массива
             if (nx_new < 0 || nx_new >= N || ny_new < 0 || ny_new >= M) {
+                cerr << "propagate_move: Пропуск границы в конце для nx_new=" << nx_new << ", ny_new=" << ny_new << "\n";
                 continue;
             }
 
@@ -482,6 +504,11 @@ std::atomic<bool> global_prop{false};
 std::mutex global_mutex;
 std::atomic<int> active_threads{0};
 
+// Добавляем мьютексы для защиты массивов
+std::mutex field_access_mutex;
+std::mutex velocity_access_mutex;
+std::mutex p_access_mutex;
+
 int main(int argc, char* argv[]) {
     size_t num_threads = std::thread::hardware_concurrency();
     if(argc > 1) {
@@ -508,45 +535,50 @@ int main(int argc, char* argv[]) {
     auto start = std::chrono::high_resolution_clock::now();
     
     for (size_t i = 0; i < T; ++i) {
-        if (i % 100 == 0) {
-            cout << "Iteration " << i << "/" << T << endl;
-        }
-
+        cout << "Starting iteration " << i << "\n" << flush;  // Отладочный вывод
+        
         std::vector<std::future<void>> futures;
         
-        // Apply external forces in single thread for safety
+        // Apply external forces sequentially to avoid race conditions
         {
-            std::lock_guard<std::mutex> lock(global_mutex);
+            std::lock_guard<std::mutex> lock(velocity_access_mutex);
             for (size_t x = 0; x < N; ++x) {
                 for (size_t y = 0; y < M; ++y) {
                     if (field[x][y] == '#') continue;
-                    // Проверка границ перед доступом
                     if (x + 1 < N && field[x + 1][y] != '#')
                         velocity.add(x, y, 1, 0, g);
                 }
             }
         }
 
-        // Copy old_p to ensure consistency
-        memcpy(old_p, p, sizeof(p));
+        // Safe copy of pressure values
+        {
+            std::lock_guard<std::mutex> lock(p_access_mutex);
+            memcpy(old_p, p, sizeof(p));
+        }
 
-        // Apply forces from p in chunks
-        const size_t chunk_size = N / num_threads;
+        // Process chunks with proper synchronization
+        const size_t chunk_size = std::max(size_t(1), N / num_threads);
         for (size_t t = 0; t < num_threads; ++t) {
             size_t start = t * chunk_size;
-            size_t end = (t == num_threads - 1) ? N : (t + 1) * chunk_size;
+            size_t end = std::min(N, (t + 1) * chunk_size);
             
             futures.push_back(pool.enqueue([&, start, end]() {
-                // Избегаем захвата global_mutex здесь, если возможно
-                for (size_t x = start; x < end; ++x) {
+                for (size_t x = start; x < end && x < N; ++x) { // Проверка x < N
                     for (size_t y = 0; y < M; ++y) {
+                        std::lock_guard<std::mutex> lock(velocity_access_mutex);
                         if (field[x][y] == '#')
                             continue;
+                        // Проверка границ массива
                         for (auto [dx, dy] : deltas) {
-                            int nx = x + dx, ny = y + dy;
-                            // Проверка границ массива
-                            if (nx < 0 || nx >= N || ny < 0 || ny >= M)
+                            int nx = x + dx;
+                            int ny = y + dy;
+
+                            if (nx < 0 || nx >= N || ny < 0 || ny >= M) { // Проверка границ
+                                cerr << "main: Пропуск границы для nx=" << nx << ", ny=" << ny << "\n";
                                 continue;
+                            }
+
                             if (field[nx][ny] != '#' && old_p[nx][ny] < old_p[x][y]) {
                                 auto delta_p = old_p[x][y] - old_p[nx][ny];
                                 auto force = delta_p;
@@ -566,26 +598,31 @@ int main(int argc, char* argv[]) {
             }));
         }
 
+        // Wait for all tasks to complete
         for(auto &fut : futures) {
             fut.get();
         }
         futures.clear();
 
-        // Make flow from velocities
+        // Make flow from velocities with synchronized access
         velocity_flow.clear();
-        std::atomic<bool> flow_continues{false}; // Уже атомарная переменная
+        std::atomic<bool> flow_continues{false};
         do {
-            flow_continues.store(false, std::memory_order_relaxed); // Сброс флага
-            UT += 2;
+            flow_continues.store(false, std::memory_order_seq_cst);
+            {
+                std::lock_guard<std::mutex> lock(velocity_access_mutex);
+                UT += 2;
+            }
 
+            // Process flow in chunks
             for (size_t x = 0; x < N; ++x) {
                 futures.push_back(pool.enqueue([&, x]() {
-                    // Избегаем захвата global_mutex внутри потоков при обработке flow
+                    std::lock_guard<std::mutex> lock(velocity_access_mutex);
                     for (size_t y = 0; y < M; ++y) {
                         if (field[x][y] != '#' && last_use[x][y] != UT) {
                             auto [t, local_prop, _] = propagate_flow(x, y, 1);
                             if (t > 0) {
-                                flow_continues.store(true, std::memory_order_relaxed); // Установка флага
+                                flow_continues.store(true, std::memory_order_seq_cst);
                             }
                         }
                     }
@@ -596,13 +633,16 @@ int main(int argc, char* argv[]) {
                 fut.get();
             }
             futures.clear();
-        } while (flow_continues.load(std::memory_order_relaxed)); // Проверка флага
+        } while (flow_continues.load(std::memory_order_seq_cst));
 
-        // Process movement sequentially for now
+        // Process movement sequentially for safety
         {
-            std::lock_guard<std::mutex> lock(global_mutex);
+            std::lock_guard<std::mutex> lock(field_access_mutex);
+            std::lock_guard<std::mutex> v_lock(velocity_access_mutex);
+            
             UT += 2;
             bool moved = false;
+            
             for (size_t x = 0; x < N; ++x) {
                 for (size_t y = 0; y < M; ++y) {
                     if (field[x][y] != '#' && last_use[x][y] != UT) {
@@ -629,7 +669,6 @@ int main(int argc, char* argv[]) {
     auto end = std::chrono::high_resolution_clock::now();
     std::chrono::duration<double> diff = end - start;
     cout << "Время выполнения: " << diff.count() << " секунд\n";
-
     
     return 0;
 }
