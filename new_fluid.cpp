@@ -15,6 +15,7 @@
 #include <tuple>
 #include <algorithm>
 #include <ranges>
+//#include <recursive_mutex> // Добавьте этот include
 
 using namespace std;
 
@@ -136,7 +137,7 @@ Fixed p[N][M]{}, old_p[N][M];
 std::mutex velocity_mutex;
 std::mutex field_mutex;
 std::mutex p_mutex;
-std::mutex last_use_mutex;  // Перемещаем объявление сюда
+std::recursive_mutex last_use_mutex;  // Изменено с std::mutex на std::recursive_mutex
 
 // Модифицируем VectorField для безопасного доступа
 struct VectorField {
@@ -197,6 +198,12 @@ tuple<Fixed, bool, pair<int, int>> propagate_flow(int x, int y, Fixed lim) {
     Fixed ret = 0;
     for (auto [dx, dy] : deltas) {
         int nx = x + dx, ny = y + dy;
+
+        // Проверка границ массива
+        if (nx < 0 || nx >= N || ny < 0 || ny >= M) {
+            continue;
+        }
+
         if (field[nx][ny] != '#' && last_use[nx][ny] < UT) {
             auto cap = velocity.get(x, y, dx, dy);
             auto flow = velocity_flow.get(x, y, dx, dy);
@@ -227,7 +234,7 @@ Fixed random01() {
 }
 
 void propagate_stop(int x, int y, bool force = false) {
-    std::lock_guard<std::mutex> lock(last_use_mutex);
+    std::lock_guard<std::recursive_mutex> lock(last_use_mutex);
     if (!force) {
         bool stop = true;
         for (auto [dx, dy] : deltas) {
@@ -282,7 +289,7 @@ struct ParticleParams {
 
 bool propagate_move(int x, int y, bool is_first) {
     {
-        std::lock_guard<std::mutex> lock(last_use_mutex);
+        std::lock_guard<std::recursive_mutex> lock(last_use_mutex);
         last_use[x][y] = UT - is_first;
     }
     
@@ -293,20 +300,19 @@ bool propagate_move(int x, int y, bool is_first) {
         Fixed sum = 0;
         for (size_t i = 0; i < deltas.size(); ++i) {
             auto [dx, dy] = deltas[i];
-            int nx = x + dx, ny = y + dy;
-            
-            bool is_valid;
-            {
-                std::lock_guard<std::mutex> lock(last_use_mutex);
-                is_valid = (field[nx][ny] != '#' && last_use[nx][ny] != UT);
-            }
-            
-            if (!is_valid) {
+            int nx_new = x + dx, ny_new = y + dy;
+
+            // Проверка границ массива
+            if (nx_new < 0 || nx_new >= N || ny_new < 0 || ny_new >= M) {
                 tres[i] = sum;
                 continue;
             }
-            
-            auto v = velocity.get_safe(x, y, dx, dy);
+
+            if (field[nx_new][ny_new] == '#' || last_use[nx_new][ny_new] == UT) {
+                tres[i] = sum;
+                continue;
+            }
+            auto v = velocity.get(x, y, dx, dy);
             if (v < 0) {
                 tres[i] = sum;
                 continue;
@@ -319,16 +325,21 @@ bool propagate_move(int x, int y, bool is_first) {
             break;
         }
 
-        Fixed p = random01() * sum;
-        size_t d = std::ranges::upper_bound(tres, p) - tres.begin();
+        Fixed p_val = random01() * sum;
+        size_t d = std::ranges::upper_bound(tres, p_val) - tres.begin();
 
         auto [dx, dy] = deltas[d];
         nx = x + dx;
         ny = y + dy;
-        
+
+        // Дополнительная проверка границ
+        if (nx < 0 || nx >= N || ny < 0 || ny >= M) {
+            continue;
+        }
+
         bool valid_move;
         {
-            std::lock_guard<std::mutex> lock(last_use_mutex);
+            std::lock_guard<std::recursive_mutex> lock(last_use_mutex);
             valid_move = velocity.get_safe(x, y, dx, dy) > 0 && 
                         field[nx][ny] != '#' && 
                         last_use[nx][ny] < UT;
@@ -339,20 +350,26 @@ bool propagate_move(int x, int y, bool is_first) {
         }
 
         {
-            std::lock_guard<std::mutex> lock(last_use_mutex);
+            std::lock_guard<std::recursive_mutex> lock(last_use_mutex);
             ret = (last_use[nx][ny] == UT - 1 || propagate_move(nx, ny, false));
         }
     } while (!ret);
 
     {
-        std::lock_guard<std::mutex> lock(last_use_mutex);
+        std::lock_guard<std::recursive_mutex> lock(last_use_mutex);
         last_use[x][y] = UT;
         
         for (auto [dx, dy] : deltas) {
-            int nx = x + dx, ny = y + dy;
-            if (field[nx][ny] != '#' && last_use[nx][ny] < UT - 1 && 
+            int nx_new = x + dx, ny_new = y + dy;
+
+            // Проверка границ массива
+            if (nx_new < 0 || nx_new >= N || ny_new < 0 || ny_new >= M) {
+                continue;
+            }
+
+            if (field[nx_new][ny_new] != '#' && last_use[nx_new][ny_new] < UT - 1 && 
                 velocity.get_safe(x, y, dx, dy) < 0) {
-                propagate_stop(nx, ny);
+                propagate_stop(nx_new, ny_new);
             }
         }
         
@@ -458,11 +475,20 @@ void recalculate_p(size_t start_x, size_t end_x) {
     }
 }
 
+// Заменяем обычную булеву переменную на атомарную для безопасного доступа из разных потоков
+std::atomic<bool> global_prop{false};
+
+// Добавляем глобальную блокировку для отладки
+std::mutex global_mutex;
+std::atomic<int> active_threads{0};
+
 int main(int argc, char* argv[]) {
     size_t num_threads = std::thread::hardware_concurrency();
-    if(argc > 1){
+    if(argc > 1) {
         num_threads = std::stoi(argv[1]);
     }
+    cout << "Running with " << num_threads << " threads" << endl;
+    
     ThreadPool pool(num_threads);
 
     rho[' '] = 0.01;
@@ -480,126 +506,130 @@ int main(int argc, char* argv[]) {
     }
 
     auto start = std::chrono::high_resolution_clock::now();
-
+    
     for (size_t i = 0; i < T; ++i) {
-        std::vector<std::future<void>> futures;
-        std::atomic<bool> local_prop{false};
+        if (i % 100 == 0) {
+            cout << "Iteration " << i << "/" << T << endl;
+        }
 
-        // Параллельные операции с защитой общих ресурсов
-        futures.push_back(pool.enqueue([&](){
-            std::lock_guard<std::mutex> lock(velocity_mutex);
+        std::vector<std::future<void>> futures;
+        
+        // Apply external forces in single thread for safety
+        {
+            std::lock_guard<std::mutex> lock(global_mutex);
             for (size_t x = 0; x < N; ++x) {
                 for (size_t y = 0; y < M; ++y) {
-                    if (field[x][y] == '#')
-                        continue;
-                    if (field[x + 1][y] != '#')
+                    if (field[x][y] == '#') continue;
+                    // Проверка границ перед доступом
+                    if (x + 1 < N && field[x + 1][y] != '#')
                         velocity.add(x, y, 1, 0, g);
                 }
             }
-        }));
+        }
 
-        // Apply forces from p
-        futures.push_back(pool.enqueue([&](){
-            memcpy(old_p, p, sizeof(p));
-            for (size_t x = 0; x < N; ++x) {
-                for (size_t y = 0; y < M; ++y) {
-                    if (field[x][y] == '#')
-                        continue;
-                    for (auto [dx, dy] : deltas) {
-                        int nx = x + dx, ny = y + dy;
-                        if (field[nx][ny] != '#' && old_p[nx][ny] < old_p[x][y]) {
-                            auto delta_p = old_p[x][y] - old_p[nx][ny];
-                            auto force = delta_p;
-                            auto &contr = velocity.get(nx, ny, -dx, -dy);
-                            if (contr * rho[(int) field[nx][ny]] >= force) {
-                                contr -= force / rho[(int) field[nx][ny]];
+        // Copy old_p to ensure consistency
+        memcpy(old_p, p, sizeof(p));
+
+        // Apply forces from p in chunks
+        const size_t chunk_size = N / num_threads;
+        for (size_t t = 0; t < num_threads; ++t) {
+            size_t start = t * chunk_size;
+            size_t end = (t == num_threads - 1) ? N : (t + 1) * chunk_size;
+            
+            futures.push_back(pool.enqueue([&, start, end]() {
+                // Избегаем захвата global_mutex здесь, если возможно
+                for (size_t x = start; x < end; ++x) {
+                    for (size_t y = 0; y < M; ++y) {
+                        if (field[x][y] == '#')
+                            continue;
+                        for (auto [dx, dy] : deltas) {
+                            int nx = x + dx, ny = y + dy;
+                            // Проверка границ массива
+                            if (nx < 0 || nx >= N || ny < 0 || ny >= M)
                                 continue;
+                            if (field[nx][ny] != '#' && old_p[nx][ny] < old_p[x][y]) {
+                                auto delta_p = old_p[x][y] - old_p[nx][ny];
+                                auto force = delta_p;
+                                auto &contr = velocity.get(nx, ny, -dx, -dy);
+                                if (contr * rho[(int) field[nx][ny]] >= force) {
+                                    contr -= force / rho[(int) field[nx][ny]];
+                                    continue;
+                                }
+                                force -= contr * rho[(int) field[nx][ny]];
+                                contr = 0;
+                                velocity.add(x, y, dx, dy, force / rho[(int) field[x][y]]);
+                                p[x][y] -= force / dirs[x][y];
                             }
-                            force -= contr * rho[(int) field[nx][ny]];
-                            contr = 0;
-                            velocity.add(x, y, dx, dy, force / rho[(int) field[x][y]]);
-                            p[x][y] -= force / dirs[x][y];
                         }
                     }
                 }
-            }
-        }));
+            }));
+        }
 
-        for(auto &fut : futures){
+        for(auto &fut : futures) {
             fut.get();
         }
+        futures.clear();
 
         // Make flow from velocities
         velocity_flow.clear();
-        bool prop = false;
+        std::atomic<bool> flow_continues{false}; // Уже атомарная переменная
         do {
+            flow_continues.store(false, std::memory_order_relaxed); // Сброс флага
             UT += 2;
-            prop = 0;
-            futures.clear();
+
             for (size_t x = 0; x < N; ++x) {
-                futures.push_back(pool.enqueue([&, x](){
+                futures.push_back(pool.enqueue([&, x]() {
+                    // Избегаем захвата global_mutex внутри потоков при обработке flow
                     for (size_t y = 0; y < M; ++y) {
                         if (field[x][y] != '#' && last_use[x][y] != UT) {
                             auto [t, local_prop, _] = propagate_flow(x, y, 1);
                             if (t > 0) {
-                                prop = 1;
+                                flow_continues.store(true, std::memory_order_relaxed); // Установка флага
                             }
                         }
                     }
                 }));
             }
-            for(auto &fut : futures){
+
+            for(auto &fut : futures) {
                 fut.get();
             }
-        } while (prop);
+            futures.clear();
+        } while (flow_continues.load(std::memory_order_relaxed)); // Проверка флага
 
-        // Recalculate p with kinetic energy - используем новую функцию
-        futures.clear();
-        const size_t chunk_size = N / num_threads;
-        for (size_t t = 0; t < num_threads; ++t) {
-            size_t start = t * chunk_size;
-            size_t end = (t == num_threads - 1) ? N : (t + 1) * chunk_size;
-            futures.push_back(pool.enqueue([&, start, end]() {
-                recalculate_p(start, end);
-            }));
-        }
-
-        for(auto &fut : futures){
-            fut.get();
-        }
-
-        UT += 2;
-        prop = false;
-        futures.clear();
-        for (size_t x = 0; x < N; ++x) {
-            futures.push_back(pool.enqueue([&, x](){
+        // Process movement sequentially for now
+        {
+            std::lock_guard<std::mutex> lock(global_mutex);
+            UT += 2;
+            bool moved = false;
+            for (size_t x = 0; x < N; ++x) {
                 for (size_t y = 0; y < M; ++y) {
                     if (field[x][y] != '#' && last_use[x][y] != UT) {
                         if (random01() < move_prob(x, y)) {
-                            prop = true;
+                            moved = true;
                             propagate_move(x, y, true);
                         } else {
                             propagate_stop(x, y, true);
                         }
                     }
                 }
-            }));
-        }
+            }
 
-        for(auto &fut : futures){
-            fut.get();
-        }
-
-        if (local_prop) {
-            std::lock_guard<std::mutex> lock(field_mutex);
-            std::cout << "Tick " << i << ":\n";
-            for (size_t x = 0; x < N; ++x) {
-                std::cout << field[x] << "\n";
+            if (moved) {
+                cout << "Tick " << i << ":\n";
+                for (size_t x = 0; x < N; ++x) {
+                    cout << field[x] << "\n";
+                }
+                cout << flush;
             }
         }
     }
 
     auto end = std::chrono::high_resolution_clock::now();
     std::chrono::duration<double> diff = end - start;
-    std::cout << "Время выполнения: " << diff.count() << " секунд\n";
+    cout << "Время выполнения: " << diff.count() << " секунд\n";
+
+    
+    return 0;
 }
